@@ -1,0 +1,17 @@
+# IDE & Virtual Environment
+.vscode
+venv
+
+# Environment Variables
+.env*
+!.env.sample
+
+# Commit message file
+commit.txt
+
+# Python
+*.pyc
+__pycache__
+
+# Mac
+.DS_Store
