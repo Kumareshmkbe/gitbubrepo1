@@ -465,12 +465,22 @@ export default class GenesysCloudPlatformService extends BasePlatformService {
 
         if (conversationName) {
           if (this.isTeardown) return;
+          const lifecycleState =
+            await this.fetchConversationLifecycleState(conversationName);
+          if (lifecycleState === "COMPLETED") {
+            this.lwc.debugLog(
+              `[AgentAssist] Conversation ${conversationName} is already COMPLETED. Waiting for next active call...`
+            );
+            throw new Error(
+              "Conversation already completed; waiting for new call."
+            );
+          }
           this.lwc.conversationName = conversationName;
           this.lwc.debugLog(
-            `Found conversationName: ${this.lwc.conversationName}. Initializing UI Modules.`
+            `Found active conversationName: ${this.lwc.conversationName}. Activating UI Modules.`
           );
-          this.handleConnectorInitialized();
-          this.initUIModules();
+          await this.handleConnectorInitialized();
+          this.startNextCallWatcher(conversationIntegrationKey);
           return;
         } else {
           // If conversation completed or empty after multiple attempts, purge stale cache
@@ -507,6 +517,40 @@ export default class GenesysCloudPlatformService extends BasePlatformService {
     };
 
     poll(initialDelay);
+  }
+
+  // Automatically detects when a new Genesys call arrives on the same open
+  // Salesforce Case Record Page and transitions the Agent Assist UI.
+  startNextCallWatcher(activeIntegrationKey) {
+    if (this.pollingTimeout) {
+      clearTimeout(this.pollingTimeout);
+    }
+    const watch = async () => {
+      if (this.isTeardown) return;
+      try {
+        this.requestGenesysInteractions();
+        const apexId = await getLatestInteractionId({
+          recordId: this.lwc.recordId
+        });
+        if (
+          apexId &&
+          isValidId(apexId) &&
+          apexId.trim() !== activeIntegrationKey
+        ) {
+          this.lwc.debugLog(
+            `[AgentAssist] New call detected in Task (${apexId.trim()}); switching from ${activeIntegrationKey}`
+          );
+          this.genesysConversationId = apexId.trim();
+          setCachedConversationId(this.genesysConversationId);
+          this.pollForConversationNameByIntegrationKey(
+            this.genesysConversationId
+          );
+          return;
+        }
+      } catch (e) {}
+      this.pollingTimeout = setTimeout(watch, 2500);
+    };
+    this.pollingTimeout = setTimeout(watch, 2500);
   }
 
   handleConversationEndedForGenesysCloud() {

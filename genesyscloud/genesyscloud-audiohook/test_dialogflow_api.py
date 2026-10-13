@@ -162,6 +162,24 @@ class TestDialogflowAPI(unittest.TestCase):
         found_none = dialogflow_api.find_participant_by_role('AUTOMATED_AGENT', participants)
         self.assertIsNone(found_none)
 
+    def test_ingest_context_references(self):
+        api = dialogflow_api.DialogflowAPI()
+        mock_refs = {'gka_search_config': MagicMock()}
+        api.ingest_context_references('projects/p/locations/global/conversations/c', mock_refs)
+        dialogflow_api.dialogflow.IngestContextReferencesRequest.assert_called_once_with(
+            conversation='projects/p/locations/global/conversations/c',
+            context_references=mock_refs,
+        )
+        api.conversations_client.ingest_context_references.assert_called_once()
+
+    def test_analyze_text_content(self):
+        api = dialogflow_api.DialogflowAPI()
+        api.analyze_text_content(
+            'projects/p/locations/global/conversations/c/participants/p1',
+            '[CONTEXT FOR SUMMARIZATION ONLY]',
+        )
+        api.participants_client.analyze_content.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()

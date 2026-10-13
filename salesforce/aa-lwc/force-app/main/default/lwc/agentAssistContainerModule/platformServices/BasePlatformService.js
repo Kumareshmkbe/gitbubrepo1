@@ -213,23 +213,23 @@ export default class BasePlatformService {
     };
 
     // Initialize the UI Modules
-    if (this.lwc.conversationName) {
-      uiModulesWrapperEl.appendChild(containerEl);
-      this.connector.init(config);
-      if (this.lwc.debugMode) {
-        this.lwc.debugLog("UiModulesConnector initialized with config:");
-        console.log(config);
-      }
+    uiModulesWrapperEl.appendChild(containerEl);
+    this.connector.init(config);
+    if (this.lwc.debugMode) {
+      this.lwc.debugLog("UiModulesConnector initialized with config:");
+      console.log(config);
+    }
 
-      // Check if Dark Mode is (still) on from another UIM instance
-      if (document.body.classList.contains("dark-mode")) {
-        this.handleDarkModeToggled({ detail: { on: true } });
-      }
+    // Check if Dark Mode is (still) on from another UIM instance
+    if (document.body.classList.contains("dark-mode")) {
+      this.handleDarkModeToggled({ detail: { on: true } });
+    }
 
-      // Make the UI Modules visible
-      uiModulesWrapperEl.classList.remove("hidden");
-      if (this.lwc.showTranscript) {
-        const transcriptContainerEl = this.lwc.refs.transcriptContainer;
+    // Make the UI Modules visible
+    uiModulesWrapperEl.classList.remove("hidden");
+    if (this.lwc.showTranscript) {
+      const transcriptContainerEl = this.lwc.refs.transcriptContainer;
+      if (transcriptContainerEl) {
         transcriptContainerEl.classList.remove("hidden");
       }
     }
@@ -298,10 +298,37 @@ export default class BasePlatformService {
     }
     this.lwc.debugLog(`ui connector token: ${this.lwc.token}`);
 
+    // Inspect the active Dialogflow Conversation (GET /v2beta1/<conversationName>)
+    // and dynamically update this.lwc.conversationProfile so container.js loads
+    // the matching Summarization Generator when routing across profiles.
+    if (!this.lwc.conversationName) {
+      this.lwc.debugLog(
+        "handleConnectorInitialized: UI shell rendered; waiting for active call conversationName..."
+      );
+      return;
+    }
+
     // Poll until Dialogflow confirms the existence of the conversationName.
     if (this.lwc.channel !== "chat") {
       await this.pollDialogflowForConversationExistence();
     }
+
+    try {
+      const conv = await this.fetchConversationDetails(
+        this.lwc.conversationName
+      );
+      if (
+        conv &&
+        conv.conversationProfile &&
+        conv.conversationProfile !== this.lwc.conversationProfile
+      ) {
+        this.lwc.debugLog(
+          `[AgentAssist] Switching Conversation Profile dynamically from ${this.lwc.conversationProfile} to ${conv.conversationProfile}`
+        );
+        this.lwc.conversationProfile = conv.conversationProfile;
+        this.initUIModules();
+      }
+    } catch (e) {}
 
     // Set the active conversation for UIM on connector initialization.
     dispatchAgentAssistEvent(
@@ -309,6 +336,18 @@ export default class BasePlatformService {
       { detail: { conversationName: this.lwc.conversationName } },
       { namespace: this.lwc.recordId }
     );
+  }
+
+  async fetchConversationDetails(
+    conversationName = this.lwc.conversationName
+  ) {
+    if (!conversationName) return null;
+    return await fetch(
+      `${this.lwc.endpoint}/${DIALOGFLOW_API_VERSION}/${conversationName}`,
+      this.createRequestOptions("GET")
+    )
+      .then((res) => (res.ok ? res.json() : null))
+      .catch(() => null);
   }
 
   async pollDialogflowForConversationExistence(

@@ -170,6 +170,9 @@ export default class AgentAssistContainerModule extends LightningElement {
       // Initialize Agent Assist UI Modules
       this.platformService.initAgentAssistEvents();
 
+      // Render UI Modules shell immediately
+      this.platformService.initUIModules();
+
       // Initialize platform-specific logic
       await this.platformService.init();
 

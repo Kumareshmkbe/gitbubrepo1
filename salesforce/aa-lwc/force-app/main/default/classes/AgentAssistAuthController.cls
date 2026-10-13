@@ -52,9 +52,9 @@ public with sharing class AgentAssistAuthController {
                     SELECT Id, CallObject, Description, Subject, CreatedDate 
                     FROM Task 
                     WHERE WhatId = :recordId 
+                    WITH USER_MODE
                     ORDER BY CreatedDate DESC 
                     LIMIT 5
-                    WITH USER_MODE
                 ];
                 for (Task t : recordTasks) {
                     if (String.isNotBlank(t.CallObject)) {
@@ -70,9 +70,9 @@ public with sharing class AgentAssistAuthController {
                 FROM Task 
                 WHERE OwnerId = :UserInfo.getUserId() 
                   AND CreatedDate >= :recentCutoff 
+                WITH USER_MODE
                 ORDER BY CreatedDate DESC 
                 LIMIT 5
-                WITH USER_MODE
             ];
             for (Task t : userTasks) {
                 if (String.isNotBlank(t.CallObject)) {

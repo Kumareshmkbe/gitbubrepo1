@@ -18,6 +18,7 @@ call Agent Assist backend
 import json
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from threading import Thread
 
 import numpy as np
@@ -57,8 +58,98 @@ class OpenConversationState:
     is_opened: bool
 
 
+def resolve_queue_config(parameters: dict) -> dict:
+    """Resolves queue configuration (lob + conversation_profile) from the AudioHook
+    "open" parameters.
+    Match order:
+        1. parameters.queueId / customConfig.queueId / customConfig.lob
+        2. Trailing 8 digits of participant.dnis, dnis, participant.ani, ani
+        3. config.queue_config["default"] (falls back to CONVERSATION_PROFILE_NAME)
+    """
+    parameters = parameters or {}
+    custom_cfg = parameters.get("customConfig", {}) or {}
+    queue_id = str(
+        parameters.get("queueId") or custom_cfg.get("queueId") or custom_cfg.get("lob") or ""
+    ).strip()
+    if queue_id and queue_id in config.queue_config:
+        return config.queue_config[queue_id]
+    participant = parameters.get("participant", {}) or {}
+    for raw_num in (
+        participant.get("dnis"),
+        parameters.get("dnis"),
+        participant.get("ani"),
+        parameters.get("ani"),
+    ):
+        if not raw_num:
+            continue
+        digits = "".join(filter(str.isdigit, str(raw_num)))
+        suffix_8 = digits[-8:] if len(digits) >= 8 else digits
+        if suffix_8 and suffix_8 in config.queue_config:
+            return config.queue_config[suffix_8]
+    return config.queue_config.get("default") or {
+        "lob": "default",
+        "conversation_profile": config.conversation_profile_name,
+    }
+
+
+def build_summarization_context_banner(lob: str) -> str:
+    """Builds a JST relative date banner for summarization context (Message #0)."""
+    jst = timezone(timedelta(hours=9))
+    now_jst = datetime.now(jst)
+    call_date = now_jst.strftime("%Y/%m/%d")
+    yesterday = (now_jst - timedelta(days=1)).strftime("%Y/%m/%d")
+    tomorrow = (now_jst + timedelta(days=1)).strftime("%Y/%m/%d")
+    return (
+        f"[CONTEXT FOR SUMMARIZATION ONLY: call_date={call_date}, "
+        f"yesterday={yesterday}, tomorrow={tomorrow}, lob={lob.lower()}]"
+    )
+
+
+def build_datastore_name() -> str:
+    """Returns the full Vertex AI Search data store resource name for PGKA."""
+    if config.datastore_id.startswith("projects/"):
+        return config.datastore_id
+    datastore_location = config.datastore_location or location_id
+    return (
+        f"projects/{config.project_id}/locations/{datastore_location}"
+        f"/collections/default_collection/dataStores/{config.datastore_id}"
+    )
+
+
+def build_gka_search_context_references(lob: str) -> tuple[str, dict]:
+    """Builds the gka_search_config context reference that filters the shared
+    PGKA data store by lob. Returns (lob_filter, context_references).
+    """
+    lob_filter = f'lob: ANY("{lob.lower()}")'
+    search_config = {
+        "filterSpecs": [
+            {
+                "dataStores": [build_datastore_name()],
+                "filter": lob_filter,
+            }
+        ]
+    }
+    # ContextReference is nested under Conversation in dialogflow_v2beta1
+    # (google-cloud-dialogflow>=2.41).
+    context_reference_type = dialogflow.Conversation.ContextReference
+    context_references = {
+        "gka_search_config": context_reference_type(
+            context_contents=[
+                context_reference_type.ContextContent(
+                    content=json.dumps(search_config),
+                    content_format=context_reference_type.ContextContent.ContentFormat.JSON,
+                )
+            ],
+            update_mode=context_reference_type.UpdateMode.OVERWRITE,
+            language_code=config.language_code,
+        )
+    }
+    return lob_filter, context_references
+
+
 def process_open_conversation_message(
         conversation_id: str,
+        parameters: dict,
         dialogflow_api: DialogflowAPI,
         agent_stream: Stream,
         customer_stream: Stream,
@@ -68,25 +159,62 @@ def process_open_conversation_message(
     """Process "open" message get from Audiohook Monitor, and establish a state
     object for conversation_name, agent_thread, user_thread, and is_opened bool
     """
+    queue_config = resolve_queue_config(parameters)
+    lob = str(queue_config.get("lob") or "default")
+    conversation_profile_name = (
+        queue_config.get("conversation_profile") or config.conversation_profile_name
+    )
+    if f"/locations/{location_id}/" not in conversation_profile_name:
+        logging.error(
+            "Resolved profile %s is not in location '%s'; falling back to %s",
+            conversation_profile_name,
+            location_id,
+            config.conversation_profile_name,
+        )
+        conversation_profile_name = config.conversation_profile_name
+    logging.info(
+        "Resolved call session to LOB: '%s', Profile: '%s'",
+        lob,
+        conversation_profile_name,
+    )
 
     conversation_profile = dialogflow_api.get_conversation_profile(
-        conversation_profile_name=config.conversation_profile_name)
+        conversation_profile_name=conversation_profile_name)
     agent_audio_config = agent_stream.define_audio_config(conversation_profile)
     customer_audio_config = customer_stream.define_audio_config(
         conversation_profile)
     normalized_conversation_id = 'a' + conversation_id
     conversation_name = create_conversation_name(
         normalized_conversation_id, location_id, project)
+    is_new_conversation = False
     try:
         dialogflow_api.get_conversation(
             conversation_name)
     except NotFound as e:
+        is_new_conversation = True
         logging.warning("Error getting the conversation : %s", e)
         dialogflow_api.create_conversation(
-            conversation_profile, normalized_conversation_id)
+            conversation_profile_name,
+            normalized_conversation_id,
+            labels={"lob": lob.lower()},
+        )
 
     store_conversation_mapping(conversation_id, conversation_name)
 
+    if is_new_conversation and config.datastore_id:
+        lob_filter, context_references = build_gka_search_context_references(lob)
+        res_ingest = dialogflow_api.ingest_context_references(
+            conversation_name, context_references
+        )
+        if res_ingest is not None:
+            logging.info(
+                "Successfully ingested LOB filter '%s' for conversation %s",
+                lob_filter,
+                conversation_name,
+            )
+
+    participant_agent = None
+    participant_user = None
     try:
         participants_list = dialogflow_api.list_participant(
             conversation_name)
@@ -102,6 +230,14 @@ def process_open_conversation_message(
                 conversation_name=conversation_name, role="END_USER")
     except NotFound as e:
         logging.error("Participants not found %s: ", e)
+
+    if is_new_conversation and participant_agent:
+        banner = build_summarization_context_banner(lob)
+        try:
+            dialogflow_api.analyze_text_content(participant_agent.name, banner)
+            logging.info("Message #0 Context injected: %s", banner)
+        except Exception as e:
+            logging.error("Error injecting Message #0 context turn: %s", e)
 
     agent_thread = Thread(
         target=dialogflow_api.maintained_streaming_analyze_content, args=(
@@ -261,6 +397,7 @@ def audiohook_connect(ws: Server):
                     # and the conversation_name for the dialogflow.Conversation object
                     open_conversation_state = process_open_conversation_message(
                         conversation_id,
+                        json_message.get("parameters", {}),
                         dialogflow_api,
                         agent_stream,
                         customer_stream,
