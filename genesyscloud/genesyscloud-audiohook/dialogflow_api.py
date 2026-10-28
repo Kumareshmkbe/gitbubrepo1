@@ -101,11 +101,14 @@ def store_conversation_mapping(integration_key: str, conversation_name: str):
         except Exception as e:
             logging.warning("Failed to fetch Google ID token: %s", e)
             
-        response = requests.post(url, json=payload, headers=headers, timeout=5)
+        response = requests.post(url, json=payload, headers=headers, timeout=2)
         response.raise_for_status()
         logging.info("Stored mapping in UI connector: %s -> %s", integration_key, conversation_name)
     except Exception as e:
         logging.error("Failed to store conversation name mapping via UI connector: %s", e)
+
+
+_CONVERSATION_PROFILE_CACHE: dict[str, dialogflow.ConversationProfile] = {}
 
 
 def find_participant_by_role(role: dialogflow.Participant.Role, participants_list: list[dialogflow.Participant]) -> dialogflow.Participant | None:
@@ -146,15 +149,20 @@ class DialogflowAPI:
     def get_conversation_profile(
             self,
             conversation_profile_name: str) -> dialogflow.ConversationProfile:
-        """Load conversation profile
-        """
+        """Load conversation profile (cached in memory after first lookup)."""
+        if conversation_profile_name in _CONVERSATION_PROFILE_CACHE:
+            logging.debug("Using cached conversation profile for %s",
+                          conversation_profile_name)
+            return _CONVERSATION_PROFILE_CACHE[conversation_profile_name]
         logging.debug("Getting conversation profile for %s ",
                       conversation_profile_name)
-        return self.conversation_profiles_client.get_conversation_profile(
+        profile = self.conversation_profiles_client.get_conversation_profile(
             request=dialogflow.GetConversationProfileRequest(
                 name=conversation_profile_name
             )
         )
+        _CONVERSATION_PROFILE_CACHE[conversation_profile_name] = profile
+        return profile
 
     def create_conversation(
         self,

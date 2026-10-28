@@ -201,27 +201,16 @@ def process_open_conversation_message(
 
     store_conversation_mapping(conversation_id, conversation_name)
 
-    if is_new_conversation and config.datastore_id:
-        lob_filter, context_references = build_gka_search_context_references(lob)
-        res_ingest = dialogflow_api.ingest_context_references(
-            conversation_name, context_references
-        )
-        if res_ingest is not None:
-            logging.info(
-                "Successfully ingested LOB filter '%s' for conversation %s",
-                lob_filter,
-                conversation_name,
-            )
-
     participant_agent = None
     participant_user = None
     try:
-        participants_list = dialogflow_api.list_participant(
-            conversation_name)
-        participant_agent = find_participant_by_role(
-            dialogflow.Participant.Role.HUMAN_AGENT, participants_list)
-        participant_user = find_participant_by_role(
-            dialogflow.Participant.Role.END_USER, participants_list)
+        if not is_new_conversation:
+            participants_list = dialogflow_api.list_participant(
+                conversation_name)
+            participant_agent = find_participant_by_role(
+                dialogflow.Participant.Role.HUMAN_AGENT, participants_list)
+            participant_user = find_participant_by_role(
+                dialogflow.Participant.Role.END_USER, participants_list)
         if not participant_agent:
             participant_agent = dialogflow_api.create_participant(
                 conversation_name=conversation_name, role="HUMAN_AGENT")
@@ -231,6 +220,17 @@ def process_open_conversation_message(
     except NotFound as e:
         logging.error("Participants not found %s: ", e)
 
+    agent_thread = Thread(
+        target=dialogflow_api.maintained_streaming_analyze_content, args=(
+            agent_stream, participant_agent, agent_audio_config))
+    user_thread = Thread(
+        target=dialogflow_api.maintained_streaming_analyze_content, args=(
+            customer_stream, participant_user, customer_audio_config))
+
+    # Send "opened" immediately so Genesys Cloud's 5-second open timer is satisfied
+    # before executing post-open context injection (Message #0 and GKA LOB filter).
+    ws.send(json.dumps(audiohook.create_opened_message()))
+
     if is_new_conversation and participant_agent:
         banner = build_summarization_context_banner(lob)
         try:
@@ -239,13 +239,21 @@ def process_open_conversation_message(
         except Exception as e:
             logging.error("Error injecting Message #0 context turn: %s", e)
 
-    agent_thread = Thread(
-        target=dialogflow_api.maintained_streaming_analyze_content, args=(
-            agent_stream, participant_agent, agent_audio_config))
-    user_thread = Thread(
-        target=dialogflow_api.maintained_streaming_analyze_content, args=(
-            customer_stream, participant_user, customer_audio_config))
-    ws.send(json.dumps(audiohook.create_opened_message()))
+    if is_new_conversation and config.datastore_id:
+        def _ingest_lob_filter():
+            lob_filter, context_references = build_gka_search_context_references(lob)
+            res_ingest = dialogflow_api.ingest_context_references(
+                conversation_name, context_references
+            )
+            if res_ingest is not None:
+                logging.info(
+                    "Successfully ingested LOB filter '%s' for conversation %s",
+                    lob_filter,
+                    conversation_name,
+                )
+
+        Thread(target=_ingest_lob_filter, daemon=True).start()
+
     return OpenConversationState(
         agent_thread,
         user_thread,
